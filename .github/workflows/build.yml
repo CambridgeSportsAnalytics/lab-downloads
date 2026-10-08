@@ -1,0 +1,256 @@
+# Build both brands of Lab from the latest prediction-lab main and the latest
+# rbp-math-lib, and publish them as a GitHub Release. The download pages link to
+# releases/latest/download/<file>, so a new release is live as soon as it lands,
+# and installed copies find it through latest-csa.json / latest-cha.json.
+#
+# Run it from the Actions tab: "Build Lab" → "Run workflow". It only runs by
+# hand, which also means pull requests from forks of this public repo can never
+# trigger it or see its secrets.
+#
+# Secrets (Settings → Secrets and variables → Actions):
+#
+#   LAB_REPO_TOKEN              required. A fine-grained personal access token
+#                               (or GitHub App token) with read-only "Contents"
+#                               access to CambridgeSportsAnalytics/prediction-lab
+#                               and CambridgeSportsAnalytics/rbp-math-lib. Both
+#                               are private.
+#
+#   TAURI_SIGNING_PRIVATE_KEY   required. The updater key whose public half is
+#                               plugins.updater.pubkey in prediction-lab's
+#                               tauri.conf.json. Installed copies refuse any
+#                               update not signed with it. Keep a backup off
+#                               GitHub: if it is lost, installed copies can
+#                               never update again.
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#                               only if that key has a password.
+#
+#   Apple signing               optional; leave unset to publish unsigned
+#                               builds. Setting all six turns on Developer ID
+#                               signing and notarization with no change to this
+#                               file:
+#                      APPLE_CERTIFICATE           base64 of the Developer ID Application .p12
+#                      APPLE_CERTIFICATE_PASSWORD  the .p12's password
+#                      APPLE_SIGNING_IDENTITY      e.g. "Developer ID Application: Name (TEAMID)"
+#                      APPLE_ID                    Apple ID email used to notarize
+#                      APPLE_PASSWORD              an app-specific password for that Apple ID
+#                      APPLE_TEAM_ID               the 10-character team ID
+#                    Then delete the "Open it the first time" step from both
+#                    pages in site/.
+
+name: Build Lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      lab_ref:
+        description: "prediction-lab branch, tag or commit to build"
+        type: string
+        default: main
+      update_engine:
+        description: "Update rbp-math-lib to its latest commit before building (off = use the engine pinned in prediction-lab's Cargo.lock)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-lab
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fetch git dependencies with the git CLI, so the token configured below is
+  # used for the private engine repo.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # Public downloads: strip symbols so the shipped binary says less about the engine.
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+
+jobs:
+  build:
+    name: Build ${{ matrix.product }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - brand: csa
+            product: CSA Prediction Lab
+            name: CSA-Prediction-Lab
+            args: ""
+          - brand: cha
+            product: CHA Prediction Lab
+            name: CHA-Prediction-Lab
+            args: --features health --config src-tauri/tauri.camhealth.conf.json
+    steps:
+      - name: Check that the required secrets are set
+        env:
+          LAB_REPO_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          missing=0
+          [ -n "$LAB_REPO_TOKEN" ] || { echo "::error::LAB_REPO_TOKEN is not set (see the top of build.yml)"; missing=1; }
+          [ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set (see the top of build.yml)"; missing=1; }
+          exit $missing
+
+      - name: Check out prediction-lab
+        uses: actions/checkout@v4
+        with:
+          repository: CambridgeSportsAnalytics/prediction-lab
+          ref: ${{ inputs.lab_ref }}
+          token: ${{ secrets.LAB_REPO_TOKEN }}
+          path: lab
+          persist-credentials: false
+
+      - name: Give git access to the private engine repo
+        env:
+          TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
+        run: git config --global url."https://x-access-token:${TOKEN}@github.com/CambridgeSportsAnalytics/".insteadOf "https://github.com/CambridgeSportsAnalytics/"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lab
+          key: ${{ matrix.brand }}
+
+      - name: Install the Tauri CLI
+        run: command -v cargo-tauri || cargo install tauri-cli --version "^2" --locked
+
+      - name: Update the engine
+        if: inputs.update_engine
+        working-directory: lab
+        run: cargo update -p rbp-math-lib
+
+      # Lab's tests pin engine behaviour it relies on (missing values, see
+      # engine_missing.rs). If a new engine changes that, nothing is published.
+      - name: Test
+        working-directory: lab
+        run: cargo test -p lab ${{ matrix.brand == 'cha' && '--features health' || '' }}
+
+      # The updater offers whatever has a higher version number, so every
+      # release needs a new one. It is <major>.<minor> from tauri.conf.json and
+      # this workflow's run number, so it only ever goes up.
+      - name: Stamp the version and record what went in
+        working-directory: lab
+        run: |
+          base=$(sed -n 's/^  "version": "\([0-9]*\.[0-9]*\)\..*",/\1/p' src-tauri/tauri.conf.json)
+          version="${base}.${{ github.run_number }}"
+          engine_version=$(grep -A2 'name = "rbp-math-lib"' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          engine_commit=$(grep -A2 'name = "rbp-math-lib"' Cargo.lock | sed -n 's/.*#\([0-9a-f]\{7\}\).*/\1/p')
+          {
+            echo "Lab: ${version} (prediction-lab@$(git rev-parse --short HEAD))"
+            echo "Engine: rbp-math-lib ${engine_version} (${engine_commit})"
+          } > ../versions.txt
+          echo "LAB_VERSION=${version}" >> "$GITHUB_ENV"
+          cat ../versions.txt
+
+      # Signing slot. Does nothing until the Apple secrets exist; then the Tauri
+      # CLI imports the certificate, signs with it and notarizes. Exporting only
+      # non-empty values matters: an empty APPLE_CERTIFICATE would still make
+      # Tauri try to import one.
+      - name: Turn on Apple signing if its secrets are set
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+              eval "val=\${$v}"
+              [ -n "$val" ] && { echo "$v<<__EOF__"; echo "$val"; echo "__EOF__"; } >> "$GITHUB_ENV"
+            done
+            echo "Signing with: $APPLE_SIGNING_IDENTITY"
+          else
+            echo "No Apple signing secrets; building unsigned (ad-hoc signed)."
+          fi
+
+      - name: Build ${{ matrix.product }}
+        working-directory: lab
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          cargo tauri build --target universal-apple-darwin ${{ matrix.args }} \
+            --config "{\"version\":\"${LAB_VERSION}\",\"bundle\":{\"createUpdaterArtifacts\":true}}"
+
+      # Fixed names, so the pages and the update feeds never need to know a
+      # version: the .dmg for people downloading, the .app.tar.gz and its
+      # signature for installed copies updating.
+      - name: Collect the files
+        run: |
+          bundle=lab/target/universal-apple-darwin/release/bundle
+          mkdir -p out
+          cp "$bundle"/dmg/*.dmg "out/${{ matrix.name }}.dmg"
+          cp "$bundle"/macos/*.app.tar.gz "out/${{ matrix.name }}.app.tar.gz"
+          cp "$bundle"/macos/*.app.tar.gz.sig "out/${{ matrix.name }}.app.tar.gz.sig"
+          cp versions.txt out/versions-${{ matrix.brand }}.txt
+          echo "${LAB_VERSION}" > out/lab-version.txt
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.brand }}
+          path: out/
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      # One feed per brand, so a CHA install is never offered the sports build.
+      # The build is universal, so both Mac architectures get the same file.
+      - name: Write the update feeds
+        run: |
+          version=$(cat out/lab-version.txt)
+          tag="v${version}"
+          echo "TAG=${tag}" >> "$GITHUB_ENV"
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          base="https://github.com/${{ github.repository }}/releases/download/${tag}"
+          engine=$(sed -n 's/^Engine: //p' out/versions-csa.txt)
+          for pair in csa:CSA-Prediction-Lab cha:CHA-Prediction-Lab; do
+            brand=${pair%%:*}; name=${pair#*:}
+            jq -n \
+              --arg version "$version" \
+              --arg notes "Engine: ${engine}" \
+              --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --arg url "${base}/${name}.app.tar.gz" \
+              --rawfile sig "out/${name}.app.tar.gz.sig" \
+              '{version: $version, notes: $notes, pub_date: $date,
+                platforms: {
+                  "darwin-aarch64": {signature: $sig, url: $url},
+                  "darwin-x86_64":  {signature: $sig, url: $url}}}' \
+              > "out/latest-${brand}.json"
+            cat "out/latest-${brand}.json"
+          done
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            cat out/versions-csa.txt
+            echo
+            echo "Built by run ${{ github.run_id }}."
+          } > notes.md
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Lab ${VERSION} · $(date -u +'%d %b %Y')" \
+            --notes-file notes.md \
+            --latest \
+            out/CSA-Prediction-Lab.dmg out/CHA-Prediction-Lab.dmg \
+            out/CSA-Prediction-Lab.app.tar.gz out/CHA-Prediction-Lab.app.tar.gz \
+            out/latest-csa.json out/latest-cha.json
