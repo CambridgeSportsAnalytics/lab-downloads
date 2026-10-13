@@ -14,7 +14,7 @@
     .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
     .then((release) => {
       const parts = [];
-      // Tags look like v0.1.0-20261008.1432; show the version and the date.
+      // Tags look like v0.1.7; show the version and the date.
       const version = (release.tag_name || '').replace(/^v/, '').split('-')[0];
       if (version) parts.push(`Version ${version}`);
       if (release.published_at) {

@@ -1,18 +1,30 @@
-# Build both brands of Lab from the latest prediction-lab main and the latest
-# rbp-math-lib, and publish them as a GitHub Release. The download pages link to
-# releases/latest/download/<file>, so a new release is live as soon as it lands,
-# and installed copies find it through latest-csa.json / latest-cha.json.
+# Build both brands of Lab and publish them as a GitHub Release. The download
+# pages link to releases/latest/download/<file>, so a new release is live as
+# soon as it lands, and installed copies find it through latest-csa.json /
+# latest-cha.json.
 #
-# Run it from the Actions tab: "Build Lab" → "Run workflow". It only runs by
-# hand, which also means pull requests from forks of this public repo can never
-# trigger it or see its secrets.
+# Run it from the Actions tab: "Build Lab" → "Run workflow". Every input is
+# optional:
+#
+#   lab_ref        which prediction-lab to build. Default: main.
+#   engine_ref     which rbp-math-lib to build it with: a tag (v1.3.9), a
+#                  branch, or a commit. Default: the highest version tag
+#                  (vX.Y.Z), so an untagged commit on the engine's main never
+#                  ships unless you ask for it.
+#   version        the version this release is called, e.g. 1.0.0. Default:
+#                  <major>.<minor> from prediction-lab's tauri.conf.json and
+#                  this workflow's run number. Either way it has to be higher
+#                  than every earlier release, because installed copies only
+#                  update to a higher version.
+#
+# It only runs by hand, which also means pull requests from forks of this
+# public repo can never trigger it or see its secrets.
 #
 # Secrets (Settings → Secrets and variables → Actions):
 #
-#   LAB_REPO_TOKEN              required. A fine-grained personal access token
-#                               (or GitHub App token) with read-only "Contents"
-#                               access to CambridgeSportsAnalytics/prediction-lab
-#                               and CambridgeSportsAnalytics/rbp-math-lib. Both
+#   LAB_REPO_TOKEN              required. A token that can read
+#                               CambridgeSportsAnalytics/prediction-lab and
+#                               CambridgeSportsAnalytics/rbp-math-lib. Both
 #                               are private.
 #
 #   TAURI_SIGNING_PRIVATE_KEY   required. The updater key whose public half is
@@ -46,10 +58,14 @@ on:
         description: "prediction-lab branch, tag or commit to build"
         type: string
         default: main
-      update_engine:
-        description: "Update rbp-math-lib to its latest commit before building (off = use the engine pinned in prediction-lab's Cargo.lock)"
-        type: boolean
-        default: true
+      engine_ref:
+        description: "rbp-math-lib tag, branch or commit to build with (blank = highest vX.Y.Z tag)"
+        type: string
+        default: ""
+      version:
+        description: "Version to call this release, e.g. 1.0.0 (blank = <major>.<minor> from tauri.conf.json + run number)"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -67,8 +83,87 @@ env:
   CARGO_PROFILE_RELEASE_STRIP: "true"
 
 jobs:
+  # Decide the two things both brands must agree on, once, before anything is
+  # built: the version number and the exact engine commit.
+  prepare:
+    name: Choose the version and the engine
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      engine_sha: ${{ steps.engine.outputs.sha }}
+      engine_ref: ${{ steps.engine.outputs.ref }}
+    steps:
+      - name: Check that the required secrets are set
+        env:
+          LAB_REPO_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          missing=0
+          [ -n "$LAB_REPO_TOKEN" ] || { echo "::error::LAB_REPO_TOKEN is not set (see the top of build.yml)"; missing=1; }
+          [ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set (see the top of build.yml)"; missing=1; }
+          exit $missing
+
+      - name: Choose the engine
+        id: engine
+        env:
+          GH_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
+          REQUESTED: ${{ inputs.engine_ref }}
+        run: |
+          repo=CambridgeSportsAnalytics/rbp-math-lib
+          ref=$(echo "$REQUESTED" | xargs)
+          if [ -z "$ref" ]; then
+            ref=$(gh api "repos/$repo/tags" --paginate --jq '.[].name' \
+                  | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1)
+            [ -n "$ref" ] || { echo "::error::rbp-math-lib has no version tags (vX.Y.Z) to default to; set engine_ref"; exit 1; }
+            echo "No engine_ref given; using the highest version tag, $ref."
+          fi
+          sha=$(gh api "repos/$repo/commits/$ref" --jq .sha 2>/dev/null) \
+            || { echo "::error::rbp-math-lib has no tag, branch or commit called '$ref'"; exit 1; }
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Engine: $ref → $sha"
+
+      - name: Choose the version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
+          REQUESTED: ${{ inputs.version }}
+          LAB_REF: ${{ inputs.lab_ref }}
+        run: |
+          # True when $1 is a strictly higher version than $2.
+          higher() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
+
+          latest=$(gh release list --repo "${{ github.repository }}" --limit 200 --json tagName --jq '.[].tagName' \
+                   | sed 's/^v//' | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1)
+          latest=${latest:-0.0.0}
+          echo "Highest version released so far: $latest"
+
+          requested=$(echo "$REQUESTED" | xargs | sed 's/^v//')
+          if [ -n "$requested" ]; then
+            echo "$requested" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              || { echo "::error::version must look like 1.2.3 (got '$REQUESTED')"; exit 1; }
+            higher "$requested" "$latest" \
+              || { echo "::error::version $requested is not higher than $latest, the highest released so far. Installed copies only update to a higher version, so nobody would be offered it."; exit 1; }
+            version=$requested
+          else
+            conf=$(gh api "repos/CambridgeSportsAnalytics/prediction-lab/contents/src-tauri/tauri.conf.json?ref=${LAB_REF}" --jq .content | base64 -d)
+            base=$(echo "$conf" | jq -r .version | cut -d. -f1-2)
+            version="${base}.${{ github.run_number }}"
+            # After a hand-picked version (say 1.0.0), <major>.<minor>.<run>
+            # from the config can come out lower. Step past it instead of
+            # publishing something no installed copy would be offered.
+            if ! higher "$version" "$latest"; then
+              IFS=. read -r ma mi pa <<< "$latest"
+              version="${ma}.${mi}.$((pa + 1))"
+              echo "::notice::${base}.${{ github.run_number }} would not be higher than $latest, so this release is $version. Raise the version in tauri.conf.json to move the default on."
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "This release: $version"
+
   build:
     name: Build ${{ matrix.product }}
+    needs: prepare
     runs-on: macos-latest
     strategy:
       fail-fast: true
@@ -82,17 +177,9 @@ jobs:
             product: CHA Prediction Lab
             name: CHA-Prediction-Lab
             args: --features health --config src-tauri/tauri.camhealth.conf.json
+    env:
+      LAB_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
-      - name: Check that the required secrets are set
-        env:
-          LAB_REPO_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: |
-          missing=0
-          [ -n "$LAB_REPO_TOKEN" ] || { echo "::error::LAB_REPO_TOKEN is not set (see the top of build.yml)"; missing=1; }
-          [ -n "$TAURI_SIGNING_PRIVATE_KEY" ] || { echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set (see the top of build.yml)"; missing=1; }
-          exit $missing
-
       - name: Check out prediction-lab
         uses: actions/checkout@v4
         with:
@@ -121,32 +208,26 @@ jobs:
       - name: Install the Tauri CLI
         run: command -v cargo-tauri || cargo install tauri-cli --version "^2" --locked
 
-      - name: Update the engine
-        if: inputs.update_engine
+      - name: Use engine ${{ needs.prepare.outputs.engine_ref }}
         working-directory: lab
-        run: cargo update -p rbp-math-lib
+        run: cargo update -p rbp-math-lib --precise ${{ needs.prepare.outputs.engine_sha }}
 
       # Lab's tests pin engine behaviour it relies on (missing values, see
-      # engine_missing.rs). If a new engine changes that, nothing is published.
+      # engine_missing.rs). If this engine changes that, nothing is published.
       - name: Test
         working-directory: lab
         run: cargo test -p lab ${{ matrix.brand == 'cha' && '--features health' || '' }}
 
-      # The updater offers whatever has a higher version number, so every
-      # release needs a new one. It is <major>.<minor> from tauri.conf.json and
-      # this workflow's run number, so it only ever goes up.
-      - name: Stamp the version and record what went in
+      - name: Record what went in
         working-directory: lab
         run: |
-          base=$(sed -n 's/^  "version": "\([0-9]*\.[0-9]*\)\..*",/\1/p' src-tauri/tauri.conf.json)
-          version="${base}.${{ github.run_number }}"
           engine_version=$(grep -A2 'name = "rbp-math-lib"' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
-          engine_commit=$(grep -A2 'name = "rbp-math-lib"' Cargo.lock | sed -n 's/.*#\([0-9a-f]\{7\}\).*/\1/p')
+          engine_ref="${{ needs.prepare.outputs.engine_ref }}"
+          engine_sha="${{ needs.prepare.outputs.engine_sha }}"
           {
-            echo "Lab: ${version} (prediction-lab@$(git rev-parse --short HEAD))"
-            echo "Engine: rbp-math-lib ${engine_version} (${engine_commit})"
+            echo "Lab: ${LAB_VERSION} (prediction-lab@$(git rev-parse --short HEAD))"
+            echo "Engine: rbp-math-lib ${engine_version} (${engine_ref}, ${engine_sha:0:7})"
           } > ../versions.txt
-          echo "LAB_VERSION=${version}" >> "$GITHUB_ENV"
           cat ../versions.txt
 
       # Signing slot. Does nothing until the Apple secrets exist; then the Tauri
@@ -192,7 +273,6 @@ jobs:
           cp "$bundle"/macos/*.app.tar.gz "out/${{ matrix.name }}.app.tar.gz"
           cp "$bundle"/macos/*.app.tar.gz.sig "out/${{ matrix.name }}.app.tar.gz.sig"
           cp versions.txt out/versions-${{ matrix.brand }}.txt
-          echo "${LAB_VERSION}" > out/lab-version.txt
           ls -la out
 
       - uses: actions/upload-artifact@v4
@@ -203,8 +283,11 @@ jobs:
 
   release:
     name: Publish release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: v${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -215,16 +298,12 @@ jobs:
       # The build is universal, so both Mac architectures get the same file.
       - name: Write the update feeds
         run: |
-          version=$(cat out/lab-version.txt)
-          tag="v${version}"
-          echo "TAG=${tag}" >> "$GITHUB_ENV"
-          echo "VERSION=${version}" >> "$GITHUB_ENV"
-          base="https://github.com/${{ github.repository }}/releases/download/${tag}"
+          base="https://github.com/${{ github.repository }}/releases/download/${TAG}"
           engine=$(sed -n 's/^Engine: //p' out/versions-csa.txt)
           for pair in csa:CSA-Prediction-Lab cha:CHA-Prediction-Lab; do
             brand=${pair%%:*}; name=${pair#*:}
             jq -n \
-              --arg version "$version" \
+              --arg version "$VERSION" \
               --arg notes "Engine: ${engine}" \
               --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               --arg url "${base}/${name}.app.tar.gz" \

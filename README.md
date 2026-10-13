@@ -13,20 +13,32 @@ customer never lands on the sports brand.
 ## How a release happens
 
 1. **Actions → Build Lab → Run workflow.**
-2. It checks out `prediction-lab` at `main` (private), updates `rbp-math-lib` to
-   its latest commit (untick *update_engine* to keep the engine pinned in
-   Lab's `Cargo.lock`), and runs Lab's tests. A failing test stops the release.
+2. It checks out `prediction-lab` at `main` (private), sets `rbp-math-lib` to
+   the engine you chose, and runs Lab's tests. A failing test stops the release.
 3. It builds both brands as universal (Apple Silicon + Intel) apps on a macOS
-   runner, stamps them `<major>.<minor>.<run number>`, and publishes a GitHub
-   Release. The release notes say which Lab commit and engine version went in.
+   runner, stamps them with the version, and publishes a GitHub Release. The
+   release notes say which Lab commit and engine went in.
 4. The download buttons link to `releases/latest/download/<file>`, so the new
    build is live the moment the release exists. Nothing in `site/` changes.
 5. Installed copies read `latest-csa.json` or `latest-cha.json` from the same
    place on launch, and offer to restart into the new version.
 
-To try a branch of prediction-lab before it is merged, put it in *lab_ref*.
-Remember that a release from a branch is still the latest release, and every
-installed copy will be offered it.
+### The inputs, all optional
+
+| Input | Blank means | Otherwise |
+| --- | --- | --- |
+| *lab_ref* | `main` | any prediction-lab branch, tag or commit |
+| *engine_ref* | the highest `vX.Y.Z` tag of rbp-math-lib | any engine tag (`v1.3.6`), branch or commit (`ff4b4ba`) |
+| *version* | `<major>.<minor>` from Lab's `tauri.conf.json` + the run number, e.g. `0.1.7` | exactly this version, e.g. `1.0.0` |
+
+A version must be higher than every earlier release, because installed copies
+only update to a higher one; the workflow refuses anything else before it
+builds. If the default would come out lower (say after you released `1.0.0` by
+hand), it uses the highest release plus one in the last place instead, and
+says so. Raise the version in `tauri.conf.json` to move the default on.
+
+A release from a branch of Lab, or from an untagged engine commit, is still
+the latest release, and every installed copy will be offered it.
 
 Each release holds, per brand: the `.dmg` people download, the signed
 `.app.tar.gz` installed copies update from, and the `latest-<brand>.json`
